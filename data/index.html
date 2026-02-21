@@ -1,0 +1,173 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>ESP32-S3 3D Controller</title>
+  <style>
+    :root { color-scheme: dark; }
+    body {
+      margin: 0;
+      font-family: Arial, Helvetica, sans-serif;
+      background: #0f1115;
+      color: #f2f2f2;
+      display: flex;
+      justify-content: center;
+      padding: 24px;
+    }
+    .panel {
+      width: min(640px, 100%);
+      background: #171a21;
+      border: 1px solid #2a2f3c;
+      border-radius: 14px;
+      padding: 18px;
+      box-shadow: 0 10px 24px rgba(0, 0, 0, 0.3);
+    }
+    h1 { margin-top: 0; font-size: 1.4rem; }
+    p { color: #b8c0d4; }
+    label {
+      display: block;
+      margin-top: 12px;
+      font-weight: 700;
+      font-size: 0.95rem;
+    }
+    input, select, button {
+      width: 100%;
+      margin-top: 8px;
+      border-radius: 10px;
+      border: 1px solid #2f3747;
+      background: #0f1218;
+      color: #fff;
+      padding: 11px 12px;
+      box-sizing: border-box;
+    }
+    button {
+      background: #2f7df3;
+      border: none;
+      font-weight: 700;
+      cursor: pointer;
+    }
+    button:hover { background: #3f8aff; }
+    .secondary { background: #394053; }
+    .secondary:hover { background: #4a5267; }
+    .row { margin-top: 12px; }
+    .status {
+      margin-top: 14px;
+      min-height: 22px;
+      font-weight: 600;
+    }
+    .ok { color: #74d58d; }
+    .err { color: #ff8a8a; }
+    code { color: #9bc2ff; }
+  </style>
+</head>
+<body>
+  <div class="panel">
+    <h1>ESP32-S3 Wireframe 3D Engine</h1>
+    <p>Connect to Wi-Fi AP <code>ESP32S3-3D-Viewer</code>, open <code>http://192.168.4.1</code>, then select a model and text.</p>
+
+    <label for="model">3D Model (.obj)</label>
+    <select id="model"></select>
+
+    <label for="overlayText">Text on screen</label>
+    <input id="overlayText" maxlength="48" placeholder="Hello from ESP32-S3" />
+
+    <label for="scale">Model scale (0.2 - 4.0)</label>
+    <input id="scale" type="number" min="0.2" max="4.0" step="0.1" value="1.2" />
+
+    <div class="row">
+      <button id="applyBtn">Apply to LCD</button>
+    </div>
+    <div class="row">
+      <button id="refreshBtn" class="secondary">Refresh model list</button>
+    </div>
+
+    <hr />
+
+    <label for="objFile">Upload new OBJ</label>
+    <input id="objFile" type="file" accept=".obj" />
+    <div class="row">
+      <button id="uploadBtn">Upload OBJ file</button>
+    </div>
+
+    <div class="status ok" id="okMsg"></div>
+    <div class="status err" id="errMsg"></div>
+  </div>
+
+  <script>
+    const modelEl = document.getElementById('model');
+    const textEl = document.getElementById('overlayText');
+    const scaleEl = document.getElementById('scale');
+    const okMsgEl = document.getElementById('okMsg');
+    const errMsgEl = document.getElementById('errMsg');
+
+    function setStatus(ok, err) {
+      okMsgEl.textContent = ok || '';
+      errMsgEl.textContent = err || '';
+    }
+
+    async function refreshModels() {
+      setStatus('', '');
+      const response = await fetch('/api/models');
+      if (!response.ok) throw new Error(await response.text());
+      const data = await response.json();
+
+      modelEl.innerHTML = '';
+      const models = data.models || [];
+      for (const modelName of models) {
+        const opt = document.createElement('option');
+        opt.value = modelName;
+        opt.textContent = modelName;
+        modelEl.appendChild(opt);
+      }
+      if (data.active) modelEl.value = data.active;
+      if (typeof data.text === 'string') textEl.value = data.text;
+      if (typeof data.scale === 'number') scaleEl.value = data.scale.toFixed(2);
+
+      if (!models.length) {
+        setStatus('', 'No OBJ files found. Upload one below.');
+      }
+    }
+
+    async function applySelection() {
+      const body = new URLSearchParams({
+        model: modelEl.value,
+        text: textEl.value,
+        scale: scaleEl.value
+      });
+      const response = await fetch('/api/select', { method: 'POST', body });
+      const text = await response.text();
+      if (!response.ok) throw new Error(text);
+      setStatus('LCD updated successfully.', '');
+    }
+
+    async function uploadObj() {
+      const fileInput = document.getElementById('objFile');
+      if (!fileInput.files.length) throw new Error('Please choose a .obj file first.');
+
+      const fd = new FormData();
+      fd.append('obj', fileInput.files[0]);
+
+      const response = await fetch('/api/upload', { method: 'POST', body: fd });
+      const text = await response.text();
+      if (!response.ok) throw new Error(text);
+      setStatus('Upload completed. Model list refreshed.', '');
+      await refreshModels();
+    }
+
+    document.getElementById('applyBtn').addEventListener('click', () => {
+      applySelection().catch(err => setStatus('', err.message));
+    });
+
+    document.getElementById('refreshBtn').addEventListener('click', () => {
+      refreshModels().catch(err => setStatus('', err.message));
+    });
+
+    document.getElementById('uploadBtn').addEventListener('click', () => {
+      uploadObj().catch(err => setStatus('', err.message));
+    });
+
+    refreshModels().catch(err => setStatus('', err.message));
+  </script>
+</body>
+</html>
