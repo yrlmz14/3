@@ -27,9 +27,10 @@ static constexpr const char* AP_SSID = "ESP32S3-3D-Viewer";
 static constexpr const char* AP_PASSWORD = "12345678";
 
 // ------------------------------- Render config --------------------------------
-static constexpr uint16_t TARGET_FRAME_MS = 33;  // ~30 FPS
+static constexpr uint16_t TARGET_FRAME_MS = 80;  // ~12.5 FPS keeps web server responsive
 static constexpr size_t MAX_VERTICES = 3500;
 static constexpr size_t MAX_EDGES = 12000;
+static constexpr size_t MAX_DRAW_EDGES_PER_FRAME = 2500;
 
 SPIClass displaySPI(FSPI);
 Adafruit_ILI9341 tft(&displaySPI, TFT_DC, TFT_CS, TFT_RST);
@@ -247,6 +248,38 @@ static int parseObjIndexToken(const String& token, size_t vertexCount) {
   return zeroBased;
 }
 
+static void normalizeVertices(std::vector<Vec3>& vertices) {
+  if (vertices.empty()) return;
+
+  Vec3 vMin = vertices.front();
+  Vec3 vMax = vertices.front();
+  for (const Vec3& v : vertices) {
+    vMin.x = std::min(vMin.x, v.x);
+    vMin.y = std::min(vMin.y, v.y);
+    vMin.z = std::min(vMin.z, v.z);
+    vMax.x = std::max(vMax.x, v.x);
+    vMax.y = std::max(vMax.y, v.y);
+    vMax.z = std::max(vMax.z, v.z);
+  }
+
+  const Vec3 center = {(vMin.x + vMax.x) * 0.5f, (vMin.y + vMax.y) * 0.5f, (vMin.z + vMax.z) * 0.5f};
+  const float dx = vMax.x - vMin.x;
+  const float dy = vMax.y - vMin.y;
+  const float dz = vMax.z - vMin.z;
+  float maxExtent = std::max(dx, std::max(dy, dz));
+  if (maxExtent < 0.0001f) {
+    maxExtent = 1.0f;
+  }
+
+  // Normalize model into roughly [-1, 1] range on the largest axis.
+  const float normScale = 2.0f / maxExtent;
+  for (Vec3& v : vertices) {
+    v.x = (v.x - center.x) * normScale;
+    v.y = (v.y - center.y) * normScale;
+    v.z = (v.z - center.z) * normScale;
+  }
+}
+
 static bool loadObjFromPath(const String& path, Model& outModel, String& err) {
   File f = SPIFFS.open(path, "r");
   if (!f) {
@@ -324,6 +357,8 @@ static bool loadObjFromPath(const String& path, Model& outModel, String& err) {
     err = "Invalid OBJ (needs vertices and faces)";
     return false;
   }
+
+  normalizeVertices(vertices);
 
   outModel.vertices = std::move(vertices);
   outModel.edges = std::move(edges);
@@ -469,9 +504,12 @@ static void ensureDefaultModel() {
 static void sendRootPage() {
   if (SPIFFS.exists("/index.html")) {
     File file = SPIFFS.open("/index.html", "r");
-    server.streamFile(file, "text/html");
-    file.close();
-    return;
+    if (file) {
+      server.streamFile(file, "text/html");
+      file.close();
+      return;
+    }
+    Serial.println("sendRootPage: /index.html exists but open failed, using fallback");
   }
   server.send(200, "text/html", kFallbackHtml);
 }
@@ -497,6 +535,11 @@ static void handleSelectApi() {
   }
 
   const String model = server.arg("model");
+  if (model.length() == 0) {
+    server.send(400, "text/plain", "Model name is empty");
+    return;
+  }
+
   const String text = server.hasArg("text") ? server.arg("text") : overlayText;
   const String scaleStr = server.hasArg("scale") ? server.arg("scale") : String(modelScale);
 
@@ -629,6 +672,7 @@ static void setupWebServer() {
   });
 
   server.begin();
+  Serial.println("HTTP server started on port 80");
 }
 
 static void renderFrame() {
@@ -679,23 +723,47 @@ static void renderFrame() {
   }
 
   tft.startWrite();
-  for (const Edge& e : currentModel.edges) {
+  size_t step = 1;
+  if (currentModel.edges.size() > MAX_DRAW_EDGES_PER_FRAME) {
+    step = (currentModel.edges.size() + MAX_DRAW_EDGES_PER_FRAME - 1) / MAX_DRAW_EDGES_PER_FRAME;
+  }
+
+  size_t drawn = 0;
+  size_t visibleLines = 0;
+  for (size_t i = 0; i < currentModel.edges.size(); i += step) {
+    const Edge& e = currentModel.edges[i];
     if (e.a >= projected.size() || e.b >= projected.size()) continue;
     const ScreenPoint& p0 = projected[e.a];
     const ScreenPoint& p1 = projected[e.b];
     if (!p0.visible && !p1.visible) continue;
     tft.drawLine(p0.x, p0.y, p1.x, p1.y, ILI9341_CYAN);
+    ++visibleLines;
+    ++drawn;
+    if ((drawn & 0x7F) == 0) {
+      yield();
+    }
   }
   tft.endWrite();
 
   tft.setTextColor(ILI9341_WHITE, ILI9341_BLACK);
   tft.setTextSize(2);
   tft.setCursor(6, 6);
-  tft.print(overlayText);
+  if (overlayText.length() == 0) {
+    tft.print(" ");
+  } else {
+    tft.print(overlayText);
+  }
 
   tft.setTextSize(1);
   tft.setCursor(6, h - 10);
   tft.print(activeModelName);
+
+  if (visibleLines == 0) {
+    tft.setTextSize(1);
+    tft.setTextColor(ILI9341_YELLOW, ILI9341_BLACK);
+    tft.setCursor(6, h - 22);
+    tft.print("Model has no visible edges");
+  }
 }
 
 static void initDisplay() {
@@ -761,9 +829,21 @@ void setup() {
   for (const String& m : models) {
     Serial.printf("model: %s\n", m.c_str());
   }
+
+  String startupModel = "";
+  for (const String& m : models) {
+    if (m == "cube.obj") {
+      startupModel = m;
+      break;
+    }
+  }
+  if (startupModel.length() == 0 && !models.empty()) {
+    startupModel = models.front();
+  }
+
   if (!models.empty()) {
     String err;
-    if (!loadModelByName(models.front(), err)) {
+    if (!loadModelByName(startupModel, err)) {
       Serial.printf("Initial model load failed: %s\n", err.c_str());
     }
   }
@@ -774,6 +854,8 @@ void setup() {
 
 void loop() {
   server.handleClient();
+  server.handleClient();
+  yield();
 
   const uint32_t now = millis();
   if (now - lastFrame >= TARGET_FRAME_MS) {
@@ -782,4 +864,5 @@ void loop() {
     if (angleY > 6.283185f) angleY -= 6.283185f;
     renderFrame();
   }
+  delay(1);
 }
