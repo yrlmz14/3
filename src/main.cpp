@@ -72,6 +72,8 @@ uint32_t lastFrame = 0;
 File uploadFile;
 bool uploadFailed = false;
 String uploadError = "";
+String uploadModelName = "";
+String uploadTargetPath = "";
 
 const char kFallbackHtml[] PROGMEM = R"HTML(
 <!doctype html>
@@ -184,8 +186,26 @@ static String jsonEscape(const String& in) {
   return out;
 }
 
+static String toLowerCopy(String value) {
+  value.toLowerCase();
+  return value;
+}
+
+static String baseName(const String& pathOrName) {
+  const int slashPos = pathOrName.lastIndexOf('/');
+  const int backslashPos = pathOrName.lastIndexOf('\\');
+  const int sepPos = std::max(slashPos, backslashPos);
+  if (sepPos < 0) return pathOrName;
+  if (sepPos + 1 >= pathOrName.length()) return "";
+  return pathOrName.substring(sepPos + 1);
+}
+
+static bool isObjName(const String& name) {
+  return toLowerCopy(name).endsWith(".obj");
+}
+
 static bool isSafeModelName(const String& name) {
-  if (!name.endsWith(".obj")) return false;
+  if (!isObjName(name)) return false;
   if (name.indexOf('/') >= 0 || name.indexOf('\\') >= 0) return false;
   if (name.indexOf("..") >= 0) return false;
   return name.length() > 0 && name.length() <= 64;
@@ -315,39 +335,117 @@ static bool loadObjFromPath(const String& path, Model& outModel, String& err) {
 static std::vector<String> listModels() {
   std::vector<String> out;
   File root = SPIFFS.open("/");
-  if (!root) return out;
+  if (!root) {
+    Serial.println("listModels: root open failed");
+    return out;
+  }
+
+  if (!root.isDirectory()) {
+    Serial.println("listModels: root is not directory, still trying openNextFile()");
+  }
 
   File entry = root.openNextFile();
   while (entry) {
     const String name = entry.name();
-    if (name.startsWith("/models/") && name.endsWith(".obj")) {
-      out.push_back(name.substring(String("/models/").length()));
+    const String modelName = baseName(name);
+    if (isSafeModelName(modelName)) {
+      bool duplicate = false;
+      for (const String& existing : out) {
+        if (existing == modelName) {
+          duplicate = true;
+          break;
+        }
+      }
+      if (!duplicate) out.push_back(modelName);
     }
     entry = root.openNextFile();
   }
 
+  if (out.empty()) {
+    if (SPIFFS.exists("/models/cube.obj")) out.push_back("cube.obj");
+    if (SPIFFS.exists("/cube.obj")) {
+      bool hasCube = false;
+      for (const String& existing : out) {
+        if (existing == "cube.obj") {
+          hasCube = true;
+          break;
+        }
+      }
+      if (!hasCube) out.push_back("cube.obj");
+    }
+  }
+
   std::sort(out.begin(), out.end());
+  Serial.printf("listModels: found %u model(s)\n", static_cast<unsigned>(out.size()));
   return out;
 }
 
+static String resolveModelPath(const String& modelName) {
+  const String cleanName = baseName(modelName);
+  if (!isSafeModelName(cleanName)) return "";
+
+  const String pathInModels = "/models/" + cleanName;
+  if (SPIFFS.exists(pathInModels)) return pathInModels;
+
+  const String pathInRoot = "/" + cleanName;
+  if (SPIFFS.exists(pathInRoot)) return pathInRoot;
+
+  if (SPIFFS.exists(cleanName)) return cleanName;
+  return "";
+}
+
+static File openModelForWrite(const String& modelName, String& outPath) {
+  outPath = "";
+  const String cleanName = baseName(modelName);
+  if (!isSafeModelName(cleanName)) return File();
+
+  File f = SPIFFS.open("/models/" + cleanName, "w");
+  if (f) {
+    outPath = "/models/" + cleanName;
+    return f;
+  }
+
+  f = SPIFFS.open("/" + cleanName, "w");
+  if (f) {
+    outPath = "/" + cleanName;
+    return f;
+  }
+
+  return File();
+}
+
 static bool loadModelByName(const String& modelName, String& err) {
-  if (!isSafeModelName(modelName)) {
+  const String cleanName = baseName(modelName);
+  if (!isSafeModelName(cleanName)) {
     err = "Bad model name";
     return false;
   }
-  const String path = "/models/" + modelName;
+
+  const String path = resolveModelPath(cleanName);
+  if (path.length() == 0) {
+    err = "Model not found in SPIFFS";
+    return false;
+  }
+
   Model m;
   if (!loadObjFromPath(path, m, err)) return false;
   currentModel = std::move(m);
-  activeModelName = modelName;
+  activeModelName = cleanName;
   projected.resize(currentModel.vertices.size());
+  Serial.printf("Model loaded: %s (%s)\n", activeModelName.c_str(), path.c_str());
   return true;
 }
 
 static void ensureDefaultModel() {
-  if (SPIFFS.exists("/models/cube.obj")) return;
-  File f = SPIFFS.open("/models/cube.obj", "w");
-  if (!f) return;
+  if (SPIFFS.exists("/models/cube.obj") || SPIFFS.exists("/cube.obj")) return;
+
+  String targetPath;
+  File f = openModelForWrite("cube.obj", targetPath);
+  if (!f) {
+    Serial.println("ensureDefaultModel: cannot create cube.obj");
+    return;
+  }
+
   f.print(
       "# Unit cube\n"
       "v -1 -1 -1\n"
@@ -365,6 +463,7 @@ static void ensureDefaultModel() {
       "f 3 4 8 7\n"
       "f 4 1 5 8\n");
   f.close();
+  Serial.printf("ensureDefaultModel: wrote %s\n", targetPath.c_str());
 }
 
 static void sendRootPage() {
@@ -419,6 +518,8 @@ static void handleSelectApi() {
 static void handleUploadStart() {
   uploadFailed = false;
   uploadError = "";
+  uploadModelName = "";
+  uploadTargetPath = "";
 }
 
 static void handleUploadData() {
@@ -430,12 +531,17 @@ static void handleUploadData() {
     if (cleanName.length() == 0) {
       uploadFailed = true;
       uploadError = "Invalid filename";
+      Serial.printf("upload start rejected: raw='%s'\n", up.filename.c_str());
       return;
     }
-    uploadFile = SPIFFS.open("/models/" + cleanName, "w");
+    uploadModelName = cleanName;
+    uploadFile = openModelForWrite(cleanName, uploadTargetPath);
     if (!uploadFile) {
       uploadFailed = true;
-      uploadError = "Cannot create file";
+      uploadError = "Cannot create file in SPIFFS";
+      Serial.printf("upload start failed: clean='%s'\n", cleanName.c_str());
+    } else {
+      Serial.printf("upload start: raw='%s' clean='%s' path='%s'\n", up.filename.c_str(), cleanName.c_str(), uploadTargetPath.c_str());
     }
     return;
   }
@@ -452,6 +558,7 @@ static void handleUploadData() {
 
   if (up.status == UPLOAD_FILE_END) {
     if (uploadFile) uploadFile.close();
+    Serial.printf("upload end: bytes=%u path='%s'\n", static_cast<unsigned>(up.totalSize), uploadTargetPath.c_str());
     return;
   }
 
@@ -463,6 +570,24 @@ static void handleUploadData() {
 }
 
 static void handleUploadDone() {
+  if (!uploadFailed && uploadModelName.length() > 0) {
+    String err;
+    Model modelTest;
+    const String path = resolveModelPath(uploadModelName);
+    if (path.length() == 0 || !loadObjFromPath(path, modelTest, err)) {
+      uploadFailed = true;
+      uploadError = "Invalid OBJ: " + err;
+      if (path.length() > 0) {
+        SPIFFS.remove(path);
+      } else if (uploadTargetPath.length() > 0) {
+        SPIFFS.remove(uploadTargetPath);
+      }
+      Serial.printf("upload validation failed: '%s' err='%s'\n", uploadModelName.c_str(), uploadError.c_str());
+    } else {
+      Serial.printf("upload validation OK: '%s'\n", uploadModelName.c_str());
+    }
+  }
+
   if (uploadFailed) {
     server.send(500, "text/plain", "Upload failed: " + uploadError);
     return;
@@ -470,11 +595,34 @@ static void handleUploadDone() {
   server.send(200, "text/plain", "OK");
 }
 
+static void handleFsApi() {
+  String out;
+  out.reserve(1024);
+  out += "total=" + String(SPIFFS.totalBytes()) + " used=" + String(SPIFFS.usedBytes()) + "\n";
+  File root = SPIFFS.open("/");
+  if (!root || !root.isDirectory()) {
+    out += "root-not-directory\n";
+    server.send(200, "text/plain", out);
+    return;
+  }
+
+  File entry = root.openNextFile();
+  while (entry) {
+    out += entry.name();
+    out += " (";
+    out += String(static_cast<unsigned>(entry.size()));
+    out += ")\n";
+    entry = root.openNextFile();
+  }
+  server.send(200, "text/plain", out);
+}
+
 static void setupWebServer() {
   server.on("/", HTTP_GET, sendRootPage);
   server.on("/api/models", HTTP_GET, handleModelsApi);
   server.on("/api/select", HTTP_POST, handleSelectApi);
   server.on("/api/upload", HTTP_POST, handleUploadDone, handleUploadData);
+  server.on("/api/fs", HTTP_GET, handleFsApi);
 
   server.onNotFound([]() {
     server.send(404, "text/plain", "Not found");
@@ -607,8 +755,12 @@ void setup() {
   }
 
   ensureDefaultModel();
+  Serial.printf("SPIFFS total=%u used=%u\n", static_cast<unsigned>(SPIFFS.totalBytes()), static_cast<unsigned>(SPIFFS.usedBytes()));
 
   std::vector<String> models = listModels();
+  for (const String& m : models) {
+    Serial.printf("model: %s\n", m.c_str());
+  }
   if (!models.empty()) {
     String err;
     if (!loadModelByName(models.front(), err)) {
