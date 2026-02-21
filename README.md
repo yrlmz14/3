@@ -8,6 +8,7 @@ This project turns your ESP32-S3 into:
 - A text overlay system for your LCD
 
 You can upload `.obj` files from the website, then choose which model and text to show on the display.
+The default PlatformIO environment is preconfigured for **N16R8** (16 MB flash + OPI PSRAM) with a large SPIFFS partition.
 
 ---
 
@@ -52,13 +53,13 @@ You can upload `.obj` files from the website, then choose which model and text t
 3. Flash firmware:
 
 ```bash
-pio run -e esp32s3 -t upload
+pio run -e esp32s3n16r8 -t upload
 ```
 
 4. Upload SPIFFS web/model files:
 
 ```bash
-pio run -e esp32s3 -t uploadfs
+pio run -e esp32s3n16r8 -t uploadfs
 ```
 
 5. Open serial monitor:
@@ -86,7 +87,7 @@ pio device monitor -b 115200
 
 ### Option B: Copy before flashing
 - Put files in `data/models/*.obj`
-- Run `pio run -e esp32s3 -t uploadfs` again.
+- Run `pio run -e esp32s3n16r8 -t uploadfs` again.
 
 ### Recommended model complexity
 
